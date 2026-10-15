@@ -1,0 +1,71 @@
+name: Build lmi kernel (Voyager + Droidspaces)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+    steps:
+      - name: Checkout builder
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/share/swift /usr/local/share/boost
+          sudo apt-get clean
+          df -h /
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential git curl wget bison flex zip bc cpio \
+            libssl-dev ccache python3 python-is-python3 rsync libxml2 libzstd1 zlib1g
+
+      - name: Fetch clang toolchain (14.0.6)
+        run: |
+          mkdir -p "$HOME/gclang" && cd "$HOME/gclang"
+          wget -q "https://github.com/ZyCromerZ/Clang/releases/download/14.0.6-20261011-release/Clang-14.0.6-20261011.tar.gz"
+          mkdir -p clang14
+          tar xzf Clang-14.0.6-20261011.tar.gz -C clang14
+          ls -l clang14/bin/clang
+
+      - name: Clone kernel source
+        run: git clone --depth=1 -b staging https://github.com/CrackerCat/Kernel_Xiaomi_sm8250_S kernel
+
+      - name: Apply Droidspaces patches and config
+        run: bash scripts/apply_droidspaces.sh "$PWD/kernel" "$HOME/gclang/clang14"
+
+      - name: Build (lmi miui)
+        run: |
+          cd kernel
+          bash build-kernel.sh lmi miui
+
+      - name: Collect artifacts
+        if: always()
+        run: |
+          mkdir -p dist
+          find kernel/anykernel kernel/out -maxdepth 2 -name '*.zip' -exec cp -v {} dist/ \; 2>/dev/null || true
+          ls -lh dist/ || true
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: voyager-lmi-droidspaces
+          path: dist/*.zip
+          if-no-files-found: warn
+
+      - name: Publish release
+        if: success()
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Voyager LMI + Droidspaces build ${{ github.run_number }}
+          files: dist/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
