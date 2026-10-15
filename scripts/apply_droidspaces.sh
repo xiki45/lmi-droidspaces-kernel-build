@@ -10,22 +10,39 @@ CLANG_DIR="${2:-$HOME/gclang/clang14}"
 
 cd "$KDIR"
 
-echo "==== [1/5] 修复仓库 BUG: 换回 MGLRU 一致的 mm/swap.c ===="
-# 上游 commit 76f5081fb1 revert 了 mm/swap.c 的 MGLRU 适配，导致与 mm_inline.h 接口不一致
-# 父提交 0960053c20 的 mm/swap.c 才是正确的
-curl -fsSL "https://raw.githubusercontent.com/CrackerCat/Kernel_Xiaomi_sm8250_S/0960053c206a18c2ee7b6784b8fdad4ac0134e7a/mm/swap.c" -o mm/swap.c
-if grep -q page_off_lru mm/swap.c; then
-  echo "ERROR: mm/swap.c 仍包含 page_off_lru（替换失败）"; exit 1
-fi
-echo "OK: page_off_lru 计数 = $(grep -c page_off_lru mm/swap.c || true)"
+GOOD_COMMIT="0960053c206a18c2ee7b6784b8fdad4ac0134e7a"
 
-echo "==== [2/5] 应用 Droidspaces 官方 non-GKI 补丁 ===="
+echo "==== [1/6] 检出可编译的基线 commit ===="
+echo "原因: staging HEAD 有两个致命问题"
+echo "  ① commit 76f5081fb1 revert 了 mm/swap.c 的 MGLRU 适配 → mm/swap.c 与 mm_inline.h 接口不一致"
+echo "  ② commit bb85db53a5/89ed53f357/78341e1a74 引入未加保护的 ksu_handle_* 调用 → 未启用 KSU 时链接失败"
+echo "  => $GOOD_COMMIT 是 revert 之前的父提交，两个问题都不存在"
+if ! git fetch --depth=1 origin "$GOOD_COMMIT" 2>/dev/null; then
+  echo "  (直接 fetch sha 失败，改用 unshallow)"
+  git fetch --unshallow origin staging
+fi
+git checkout "$GOOD_COMMIT" 2>/dev/null || git checkout FETCH_HEAD
+echo "  当前 HEAD: $(git rev-parse --short HEAD)"
+
+echo "==== [2/6] 校验基线一致性 ===="
+if [ "$(grep -c page_off_lru mm/swap.c || true)" != "0" ]; then
+  echo "ERROR: mm/swap.c 仍是坏的版本"; exit 1
+fi
+echo "  OK: mm/swap.c 一致 (page_off_lru = 0)"
+for f in fs/open.c fs/read_write.c fs/stat.c fs/exec.c; do
+  if [ "$(grep -c ksu_handle "$f" || true)" != "0" ]; then
+    echo "ERROR: $f 仍含 ksu_handle 调用"; exit 1
+  fi
+done
+echo "  OK: fs/* 无 ksu_handle 残留"
+
+echo "==== [3/6] 应用 Droidspaces 官方 non-GKI 补丁 ===="
 curl -fsSL "https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/non-GKI/01.fix_kernel_panic_in_xt_qtaguid.patch" -o /tmp/ds1.patch
 curl -fsSL "https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/non-GKI/02.fix_restore%20cgroup%20file%20prefix%20handling%20.patch" -o /tmp/ds2.patch
-patch -p1 --forward -r - < /tmp/ds1.patch || echo "warn: patch 01 未干净应用"
-patch -p1 --forward -r - < /tmp/ds2.patch || echo "warn: patch 02 未干净应用"
+patch -p1 --forward -r - < /tmp/ds1.patch || echo "  warn: patch 01 未干净应用"
+patch -p1 --forward -r - < /tmp/ds2.patch || echo "  warn: patch 02 未干净应用"
 
-echo "==== [3/5] 写入 Droidspaces 内核配置 ===="
+echo "==== [4/6] 写入 Droidspaces 内核配置 ===="
 python3 - <<'PY'
 ENABLE = [
  "CONFIG_SYSVIPC", "CONFIG_POSIX_MQUEUE", "CONFIG_PID_NS", "CONFIG_IPC_NS",
@@ -56,10 +73,10 @@ for path in TARGETS:
     for c in DISABLE:
         setopt(c, False)
     open(path, "w").write("\n".join(lines))
-    print("patched:", path)
+    print("  patched:", path)
 PY
 
-echo "==== [4/5] 注入 overwrite_config 钩子（双保险）===="
+echo "==== [5/6] 注入 overwrite_config 钩子（双保险）===="
 python3 - <<'PY'
 p = "build_config/build.args.MIUI"
 s = open(p).read()
@@ -68,18 +85,18 @@ opts = ["SYSVIPC", "POSIX_MQUEUE", "PID_NS", "IPC_NS", "USER_NS", "DEVTMPFS", "M
 add = "".join("\t\t-e\t%s\t\t\t\\\n" % o for o in opts)
 add += "\t\t-d\tANDROID_PARANOID_NETWORK\t\\\n"
 if "SYSVIPC" in s:
-    print("hook 已存在，跳过")
+    print("  hook 已存在，跳过")
 elif anchor in s:
     open(p, "w").write(s.replace(anchor, anchor + add))
-    print("hook 已注入")
+    print("  hook 已注入")
 else:
-    print("WARN: 未找到锚点，跳过 hook 注入")
+    print("  WARN: 未找到锚点，跳过 hook 注入")
 PY
 
-echo "==== [5/5] 设置 CLANG_PATH ===="
+echo "==== [6/6] 设置 CLANG_PATH ===="
 sed -i "s|^CLANG_PATH=.*|CLANG_PATH=${CLANG_DIR}|" build_config/build.args.MIUI
 
-echo "==== 校验 ===="
+echo "==== 最终校验 ===="
 grep -E "^CONFIG_(PID_NS|IPC_NS|SYSVIPC|POSIX_MQUEUE)=y" arch/arm64/configs/vendor/output/lmi_defconfig || true
 grep '^CLANG_PATH' build_config/build.args.MIUI
 echo "==== 全部完成 ===="
